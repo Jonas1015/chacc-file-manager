@@ -73,23 +73,26 @@ classDiagram
     StoragePolicy --> "1" StorageChannel
 ```
 
-## Data Flow
+## Order of Events / Request Flow
 
 ```mermaid
 sequenceDiagram
     participant Client
     participant Router
     participant FileService
-    participant LocalAdapter
+    participant AdapterRegistry
+    participant Adapter
     participant FileSystem
     participant Database
 
     Client->>Router: POST /files (multipart form)
     Router->>FileService: save_file()
-    FileService->>LocalAdapter: save(uuid, content)
-    LocalAdapter->>FileSystem: write to temp -> rename
-    LocalAdapter-->>FileService: uuid
-    FileService->>Database: create FileRecord(uuid, storage_key=uuid)
+    FileService->>AdapterRegistry: get_default()
+    AdapterRegistry-->>FileService: adapter instance
+    FileService->>Adapter: save(uuid, content, content_type)
+    Adapter->>FileSystem: write to storage dir
+    Adapter-->>FileService: storage_key
+    FileService->>Database: create FileRecord
     FileService-->>Router: FileRecord
     Router-->>Client: {uuid, filename, size}
 
@@ -97,8 +100,18 @@ sequenceDiagram
     Router->>FileService: get_file(uuid)
     FileService->>Database: query FileRecord
     FileService-->>Router: FileRecord
-    Router->>FileSystem: stream from storage_dir/uuid
+    Router->>AdapterRegistry: get(adapter_name)
+    AdapterRegistry-->>Router: adapter instance
+    Router->>FileSystem: stream from storage/storage_key
     Router-->>Client: file content + headers
+
+    Client->>Router: GET /files/adapters
+    Router->>AdapterRegistry: list()
+    Router-->>Client: registered adapter names
+
+    Client->>Router: GET /files/channels
+    Router->>Database: query StorageChannel
+    Router-->>Client: list of channels
 ```
 
 ## Design Choices
@@ -125,12 +138,28 @@ sequenceDiagram
 
 ## API Endpoints
 
+### File Operations
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/files/` | POST | Upload a file (multipart form with `file` field) |
-| `/files/{uuid}/content` | GET | Serve file content by UUID |
+| `/files/{uuid}/content` | GET | Serve file content by UUID (inline for HTML) |
 | `/files/{uuid}/content?download=1` | GET | Download file with attachment disposition |
 | `/files/{uuid}` | DELETE | Delete a file by UUID |
+
+### Metadata Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/files/adapters` | GET | List all registered adapter names |
+| `/files/adapters/{name}` | GET | Get adapter info by name |
+| `/files/channels` | GET | List all storage channels |
+| `/files/policies/{channel}` | GET | Get storage policy for a channel |
+
+### System Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
 | `/files/health` | GET | Module health check |
 
 ## Configuration
@@ -139,7 +168,7 @@ Environment variables (prefixed with `CHACC_FILE_MANAGER_`):
 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
-| `STORAGE_DIR` | string | `/uploads` | Base directory for file storage |
+| `STORAGE_DIR` | string | `/tmp/chacc_file_storage` | Base directory for file storage |
 | `MAX_FILE_SIZE` | int | 10485760 | Maximum file size in bytes (10MB) |
 | `DEFAULT_CHANNEL` | string | `default` | Default storage channel |
 
@@ -149,17 +178,42 @@ Environment variables (prefixed with `CHACC_FILE_MANAGER_`):
 flowchart TD
     A[POST /files] --> B[Generate UUID]
     B --> C[Compute SHA-256 checksum]
-    C --> D[Save to storage/{uuid}]
-    D --> E[Create DB record]
+    C --> D[Save to STORAGE_DIR/uuid]
+    D --> E[Create DB FileRecord]
     E --> F[Return UUID to client]
 
-    G[GET /files/{uuid}] --> H[Lookup FileRecord]
-    H --> I[Stream file from storage/{storage_key}]
-    I --> J[Return with headers]
+    G[GET /files] --> H[Lookup FileRecord by UUID]
+    H --> I[Resolve adapter via AdapterRegistry]
+    I --> J[Stream file from storage]
+    J --> K[Return with CDN-ready headers]
 
-    K[DELETE /files/{uuid}] --> L[Lookup FileRecord]
-    L --> M[Delete from filesystem]
-    M --> N[Delete DB record]
+    L[DELETE /files] --> M[Lookup FileRecord]
+    M --> N[Delete from filesystem via adapter]
+    N --> O[Delete DB record]
+
+    P[GET /files/adapters] --> Q[Read AdapterRegistry._adapters]
+    Q --> R[Return registered adapter list]
+
+    S[GET /files/channels] --> T[Query StorageChannel table]
+    T --> U[Return channel list]
+```
+
+## Channel & Policy Management
+
+Channels define logical storage buckets that map to adapters:
+
+```mermaid
+flowchart LR
+    A[Module saves file] --> B{Channel specified?}
+    B -->|No| C[Use DEFAULT_CHANNEL]
+    B -->|Yes| D[Use specified channel]
+    C --> E[Lookup channel config]
+    D --> E
+    E --> F[Adapter registered for channel?]
+    F -->|Yes| G[Use configured adapter]
+    F -->|No| H[Use default adapter]
+    G --> I[Save via adapter]
+    H --> I
 ```
 
 ## Adapter Interface
@@ -193,6 +247,18 @@ class S3Adapter(BaseAdapter):
         return file_url
 ```
 
+Register during module setup:
+
+```python
+# In main.py setup_plugin()
+s3_adapter = S3Adapter(bucket="my-bucket", region="us-east-1")
+AdapterRegistry.register(s3_adapter, name="s3")
+
+# Create a channel that uses S3
+channel = StorageChannel(name="user_avatars", adapter_name="s3")
+db.add(channel)
+```
+
 ## Testing
 
 ```bash
@@ -207,3 +273,160 @@ python src/run_tests.py
 
 - `aiofiles>=23.0.0` - Async file I/O
 - `pydantic-settings>=2.0.0` - Configuration management
+
+## .env Configuration
+
+Add to your project's `.env` file:
+
+```bash
+# File Manager Settings
+CHACC_FILE_MANAGER_STORAGE_DIR=/var/lib/app/uploads
+CHACC_FILE_MANAGER_MAX_FILE_SIZE=52428800
+CHACC_FILE_MANAGER_DEFAULT_CHANNEL=default
+CHACC_FILE_MANAGER_SERVE_PATH_PREFIX=/files
+```
+
+Settings are automatically loaded via `FileManagerConfig` (pydantic-settings).
+
+## Usage: Saving Files Programmatically
+
+### From Within the ChaCC Backbone
+
+```python
+from context_factory import get_module_context
+
+# Get the file service from module context
+context = get_module_context()
+
+# Create FileService and save a file
+from service import FileService
+
+service = FileService()
+record = await service.save_file(
+    file_content=b"file binary data",
+    filename="my_document.pdf",
+    content_type="application/pdf",
+    created_by_module="my_module_name",
+    channel="user_uploads",  # Optional, uses DEFAULT_CHANNEL if not set
+)
+
+# Result returned after saving
+print(record.uuid)           # UUID used to access file
+print(record.filename)       # Original filename (for display)
+print(record.storage_key)    # Same as UUID (internal storage key)
+print(record.size)           # File size in bytes
+print(record.checksum)       # SHA-256 checksum
+```
+
+### Using Dependency Injection
+
+```python
+from fastapi import APIRouter, Depends
+from service import FileService
+
+router = APIRouter()
+
+async def get_file_service():
+    """Create FileService instance for injection."""
+    return FileService()
+
+@router.post("/upload")
+async def upload_document(
+    request: Request,
+    file_service: FileService = Depends(get_file_service),
+    db = Depends(get_db),
+):
+    form = await request.form()
+    file = form.get("document")
+    
+    record = await file_service.save_file(
+        file_content=await file.read(),
+        filename=file.filename,
+        content_type=file.content_type or "application/octet-stream",
+        created_by_module="my_module",
+    )
+    db.add(record)
+    db.commit()
+    
+    return {"uuid": record.uuid, "url": f"/files/{record.uuid}/content"}
+```
+
+### Accessing Files After Save
+
+```python
+# Get file URL for download
+url = await file_service.get_download_url(
+    file_uuid=record.uuid,
+    request=request,  # FastAPI Request object
+    db_session=db,
+)
+
+# Or serve directly via endpoint
+# GET /files/{uuid}/content?download=1
+```
+
+## Policy & Channel Management
+
+### Create a Channel
+
+```bash
+POST /files/channels
+Content-Type: application/json
+
+{
+    "name": "user_uploads",
+    "adapter_name": "local",
+    "description": "For user uploaded files"
+}
+```
+
+### Set/Update a Policy
+
+```bash
+POST /files/policies/user_uploads
+Content-Type: application/json
+
+{
+    "adapter_name": "local",
+    "max_file_size": 52428800
+}
+```
+
+### List All Policies
+
+```bash
+# Get policy for specific channel
+GET /files/policies/{channel}
+
+# List all channels to see their adapters
+GET /files/channels
+```
+
+### Delete a Policy
+
+```bash
+DELETE /files/policies/{channel}
+```
+
+### Runtime Adapter Registry
+
+```bash
+# See all registered adapters
+GET /files/adapters
+
+# Check specific adapter
+GET /files/adapters/{name}
+```
+
+## Module-to-Adapter Mapping
+
+Channels define which adapter a module should use for file storage:
+
+```mermaid
+flowchart LR
+    A[Your Module] --> B[StorageChannel: user_avatars]
+    B --> C[LocalAdapter: /uploads/avatars]
+    
+    D[Another Module] --> E[StorageChannel: documents]
+    E --> F[S3Adapter: s3://bucket/docs]
+```

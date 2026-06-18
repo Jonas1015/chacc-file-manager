@@ -5,16 +5,17 @@ import os
 
 
 class StorageChannelConfig(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="FILE_MANAGER_")
+    model_config = SettingsConfigDict(env_prefix="CHACC_FILE_MANAGER_")
+
     adapter_name: str = "local"
     max_file_size: int = Field(default=10485760, description="Max file size in bytes (default 10MB)")
-    allowed_mime_types: List[str] = Field(default_factory=lambda: ["image/*", "application/pdf", "text/plain"])
 
 
 class FileManagerConfig(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="FILE_MANAGER_")
+    model_config = SettingsConfigDict(env_prefix="CHACC_FILE_MANAGER_")
+
     STORAGE_DIR: str = Field(
-        default="/uploads",
+        default="/tmp/chacc_file_storage",
         description="Base directory for file storage"
     )
     MAX_FILE_SIZE: int = Field(

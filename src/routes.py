@@ -1,16 +1,109 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from typing import Optional
+from pydantic import BaseModel
+from typing import Optional, List
 import aiofiles
 import os
+from sqlalchemy import select
 
 from .context_factory import get_db
-from .models import FileRecord
+from .models import FileRecord, StorageChannel, StoragePolicy
 from .service import FileService
 from .adapters.base import AdapterRegistry
 from .exceptions import FileTooLargeError, InvalidContentTypeError
 
+
+class PolicyCreate(BaseModel):
+    adapter_name: str
+    max_file_size: Optional[int] = None
+
+
+class ChannelCreate(BaseModel):
+    name: str
+    adapter_name: str
+    description: Optional[str] = None
+
+
 router = APIRouter(prefix="/files")
+
+
+@router.get("/adapters")
+async def list_adapters():
+    """List all registered adapters."""
+    return {"adapters": list(AdapterRegistry._adapters.keys())}
+
+
+@router.get("/adapters/{name}")
+async def get_adapter(name: str):
+    """Get adapter info by name."""
+    if name not in AdapterRegistry._adapters:
+        raise HTTPException(status_code=404, detail="Adapter not found")
+    return {"name": name, "status": "registered"}
+
+
+@router.get("/channels", response_model=List[dict])
+async def list_channels(db=Depends(get_db)):
+    """List all storage channels."""
+    result = await db.execute(select(StorageChannel))
+    channels = result.scalars().all()
+    return [{"name": c.name, "adapter_name": c.adapter_name, "is_active": c.is_active} for c in channels]
+
+
+@router.post("/channels", status_code=status.HTTP_201_CREATED)
+async def create_channel(channel: ChannelCreate, db=Depends(get_db)):
+    """Create a storage channel."""
+    if channel.adapter_name not in AdapterRegistry._adapters:
+        raise HTTPException(status_code=400, detail="Adapter not registered")
+    db_channel = StorageChannel(
+        name=channel.name,
+        adapter_name=channel.adapter_name,
+        description=channel.description,
+    )
+    db.add(db_channel)
+    db.commit()
+    return {"name": db_channel.name, "adapter_name": db_channel.adapter_name}
+
+
+@router.get("/policies/{channel}", response_model=Optional[dict])
+async def get_policy(channel: str, db=Depends(get_db)):
+    """Get storage policy for a channel."""
+    result = await db.execute(select(StoragePolicy).where(StoragePolicy.channel == channel))
+    policy = result.scalar_one_or_none()
+    if not policy:
+        return None
+    return {"channel": policy.channel, "adapter_name": policy.adapter_name, "max_file_size": policy.max_file_size}
+
+
+@router.post("/policies/{channel}", status_code=status.HTTP_201_CREATED)
+async def set_policy(channel: str, policy: PolicyCreate, db=Depends(get_db)):
+    """Set or update storage policy for a channel."""
+    if policy.adapter_name not in AdapterRegistry._adapters:
+        raise HTTPException(status_code=400, detail="Adapter not registered")
+    result = await db.execute(select(StoragePolicy).where(StoragePolicy.channel == channel))
+    db_policy = result.scalar_one_or_none()
+    if db_policy:
+        db_policy.adapter_name = policy.adapter_name
+        if policy.max_file_size is not None:
+            db_policy.max_file_size = policy.max_file_size
+    else:
+        db_policy = StoragePolicy(
+            channel=channel,
+            adapter_name=policy.adapter_name,
+            max_file_size=policy.max_file_size or 10485760,
+        )
+        db.add(db_policy)
+    db.commit()
+    return {"channel": db_policy.channel, "adapter_name": db_policy.adapter_name, "max_file_size": db_policy.max_file_size}
+
+
+@router.delete("/policies/{channel}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_policy(channel: str, db=Depends(get_db)):
+    """Delete storage policy for a channel."""
+    result = await db.execute(select(StoragePolicy).where(StoragePolicy.channel == channel))
+    db_policy = result.scalar_one_or_none()
+    if db_policy:
+        db.delete(db_policy)
+        db.commit()
 
 
 @router.get("/{uuid}/content")
