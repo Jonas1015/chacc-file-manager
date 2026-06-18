@@ -4,10 +4,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-module_dir = os.path.dirname(os.path.abspath(__file__))
-
-from models import FileRecord, StorageChannel, StoragePolicy
-from exceptions import (
+from ..models import FileRecord, StorageChannel, StoragePolicy
+from ..exceptions import (
     FileTooLargeError,
     InvalidContentTypeError,
     FileNotFoundError,
@@ -43,7 +41,7 @@ def test_file_record_creation():
 
 
 def test_sanitize_filename():
-    from service import sanitize_filename
+    from ..service import sanitize_filename
     assert sanitize_filename("test file.txt") == "testfile.txt"
     assert sanitize_filename("../../../etc/passwd") == "......etcpasswd"
     assert sanitize_filename("file<>.pdf") == "file.pdf"
@@ -51,20 +49,20 @@ def test_sanitize_filename():
 
 
 def test_checksum_generation():
-    from service import generate_checksum
+    from ..service import generate_checksum
     checksum = generate_checksum(b"test content")
     assert len(checksum) == 64
 
 
 def test_config():
-    from config import get_config
+    from ..config import get_config
     config = get_config()
     assert config.STORAGE_DIR is not None
     assert config.MAX_FILE_SIZE > 0
 
 
 def test_local_adapter():
-    from adapters.local import LocalAdapter
+    from ..adapters.local import LocalAdapter
     with tempfile.TemporaryDirectory() as tmpdir:
         adapter = LocalAdapter(storage_dir=tmpdir)
         assert adapter.name == "local"
@@ -72,7 +70,7 @@ def test_local_adapter():
 
 @pytest.mark.asyncio
 async def test_adapter_save_and_delete():
-    from adapters.local import LocalAdapter
+    from ..adapters.local import LocalAdapter
     with tempfile.TemporaryDirectory() as tmpdir:
         adapter = LocalAdapter(storage_dir=tmpdir)
         storage_key = "test-uuid-123"
@@ -85,7 +83,7 @@ async def test_adapter_save_and_delete():
 
 @pytest.mark.asyncio
 async def test_adapter_path_traversal_protection():
-    from adapters.local import LocalAdapter
+    from ..adapters.local import LocalAdapter
     with tempfile.TemporaryDirectory() as tmpdir:
         adapter = LocalAdapter(storage_dir=tmpdir)
         try:
@@ -96,7 +94,7 @@ async def test_adapter_path_traversal_protection():
 
 
 def test_router_exists():
-    from routes import router
+    from ..routes import router
     assert router is not None
     assert hasattr(router, "routes")
 
@@ -104,13 +102,12 @@ def test_router_exists():
 def run_module_tests():
     import subprocess
     tests_dir = Path(__file__).resolve().parent
-    plugin_root = tests_dir.parent
-    host_root = plugin_root.parent.parent
-    venv_python = host_root / "venv" / "bin" / "python"
+    plugin_root = tests_dir.parent.parent
+    venv_python = plugin_root.parent / "venv" / "bin" / "python"
     python = str(venv_python if venv_python.exists() else sys.executable)
     result = subprocess.run(
         [python, "-m", "pytest", str(tests_dir), "-v", "--tb=short"],
-        cwd=str(plugin_root),
+        cwd=str(tests_dir),
         env={**os.environ, "PYTHONPATH": str(plugin_root)},
     )
     if result.returncode == 0:
