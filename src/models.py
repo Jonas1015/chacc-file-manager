@@ -16,7 +16,8 @@ class FileRecord(ChaCCBaseModel):
 
     uuid = Column(String(36), primary_key=True, index=True)
     adapter_name = Column(String(100), nullable=False)
-    channel = Column(String(100), nullable=False, index=True)
+    module_dir = Column(String(100), nullable=True)
+    channel = Column(String(100), nullable=True)
     filename = Column(String(255), nullable=False)
     content_type = Column(String(100), nullable=False)
     size = Column(Integer, nullable=False)
@@ -27,20 +28,10 @@ class FileRecord(ChaCCBaseModel):
 
 
 @register_model
-class StorageChannel(ChaCCBaseModel):
-    __tablename__ = "file_storage_channels"
+class ModuleAdapterMapping(ChaCCBaseModel):
+    __tablename__ = "file_module_adapter_mappings"
 
-    name = Column(String(100), primary_key=True)
+    module_name = Column(String(100), primary_key=True)
     adapter_name = Column(String(100), nullable=False)
+    use_module_dir = Column(Boolean, default=False, nullable=False)
     description = Column(String(500), nullable=True)
-    is_active = Column(Boolean, default=True, nullable=False)
-
-
-@register_model
-class StoragePolicy(ChaCCBaseModel):
-    __tablename__ = "file_storage_policies"
-
-    channel = Column(String(100), primary_key=True)
-    adapter_name = Column(String(100), nullable=False)
-    max_file_size = Column(Integer, default=10485760)
-    priority = Column(Integer, default=10)

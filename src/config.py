@@ -1,14 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
-from typing import Dict, List, Optional
+from typing import Optional
 import os
-
-
-class StorageChannelConfig(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="CHACC_FILE_MANAGER_")
-
-    adapter_name: str = "local"
-    max_file_size: int = Field(default=10485760, description="Max file size in bytes (default 10MB)")
 
 
 class FileManagerConfig(BaseSettings):
@@ -21,14 +14,6 @@ class FileManagerConfig(BaseSettings):
     MAX_FILE_SIZE: int = Field(
         default=10485760,
         description="Default max file size in bytes (default 10MB)"
-    )
-    ALLOWED_MIME_TYPES: Dict[str, List[str]] = Field(
-        default_factory=lambda: {},
-        description="Per-channel MIME type allowlists"
-    )
-    DEFAULT_CHANNEL: str = Field(
-        default="default",
-        description="Default storage channel for uploads"
     )
     SERVE_PATH_PREFIX: Optional[str] = Field(
         default=None,

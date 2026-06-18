@@ -5,7 +5,7 @@ from typing import Optional, Any
 from fastapi import Request, HTTPException
 from sqlalchemy import select
 
-from .models import FileRecord
+from .models import FileRecord, ModuleAdapterMapping
 from .adapters.base import AdapterRegistry
 from .config import get_config, FileManagerConfig
 from .exceptions import (
@@ -28,6 +28,18 @@ class FileService:
     def __init__(self, config: Optional[FileManagerConfig] = None):
         self.config = config or get_config()
 
+    def _resolve_adapter_for_module(self, module_name: str, db_session) -> Any:
+        result = db_session.execute(
+            select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name)
+        )
+        mapping = result.scalar_one_or_none()
+        if mapping and mapping.adapter_name in AdapterRegistry._adapters:
+            return AdapterRegistry.get(mapping.adapter_name), mapping.use_module_dir
+        adapter = AdapterRegistry.get_default()
+        if not adapter:
+            raise ValueError(f"No default adapter registered for module '{module_name}'")
+        return adapter, False
+
     async def save_file(
         self,
         file_content: bytes,
@@ -35,15 +47,30 @@ class FileService:
         content_type: str,
         created_by_module: str,
         channel: Optional[str] = None,
+        db_session=None,
+        adapter_name: Optional[str] = None,
     ) -> FileRecord:
-        channel = channel or self.config.DEFAULT_CHANNEL
+        if adapter_name and adapter_name in AdapterRegistry._adapters:
+            adapter = AdapterRegistry.get(adapter_name)
+            use_module_dir = False
+        elif db_session:
+            adapter, use_module_dir = self._resolve_adapter_for_module(created_by_module, db_session)
+        else:
+            adapter = AdapterRegistry.get_default()
+            if not adapter:
+                raise ValueError("No adapter registered")
+            use_module_dir = False
 
-        adapter = AdapterRegistry.get_default()
         file_uuid = str(uuid.uuid4())
         safe_filename = sanitize_filename(filename)
         checksum = generate_checksum(file_content)
 
         storage_key = file_uuid
+        if use_module_dir:
+            storage_key = f"{created_by_module}/{storage_key}"
+            if channel:
+                storage_key = f"{created_by_module}/{channel}/{storage_key}"
+
         await adapter.save(
             file_uuid=storage_key,
             content=file_content,
@@ -54,7 +81,8 @@ class FileService:
             record = FileRecord(
                 uuid=file_uuid,
                 adapter_name=adapter.name,
-                channel=channel,
+                module_dir=created_by_module if use_module_dir else None,
+                channel=channel if use_module_dir else None,
                 filename=safe_filename,
                 content_type=content_type,
                 size=len(file_content),

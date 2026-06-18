@@ -19,7 +19,7 @@ class QuotaExceededError(FileStorageError):
 
 
 class InvalidContentTypeError(FileStorageError):
-    """Invalid content type for the channel."""
+    """Invalid content type."""
     pass
 
 

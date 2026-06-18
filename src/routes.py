@@ -4,23 +4,18 @@ from pydantic import BaseModel
 from typing import Optional, List
 import aiofiles
 import os
-from sqlalchemy import select
 
 from .context_factory import get_db
-from .models import FileRecord, StorageChannel, StoragePolicy
+from .models import FileRecord, ModuleAdapterMapping
 from .service import FileService
 from .adapters.base import AdapterRegistry
 from .exceptions import FileTooLargeError, InvalidContentTypeError
 
 
-class PolicyCreate(BaseModel):
+class ModuleMappingCreate(BaseModel):
+    module_name: str
     adapter_name: str
-    max_file_size: Optional[int] = None
-
-
-class ChannelCreate(BaseModel):
-    name: str
-    adapter_name: str
+    use_module_dir: bool = False
     description: Optional[str] = None
 
 
@@ -41,68 +36,39 @@ async def get_adapter(name: str):
     return {"name": name, "status": "registered"}
 
 
-@router.get("/channels", response_model=List[dict])
-async def list_channels(db=Depends(get_db)):
-    """List all storage channels."""
-    result = await db.execute(select(StorageChannel))
-    channels = result.scalars().all()
-    return [{"name": c.name, "adapter_name": c.adapter_name, "is_active": c.is_active} for c in channels]
+@router.get("/module-mappings", response_model=List[dict])
+async def list_module_mappings(db=Depends(get_db)):
+    """List all module-to-adapter mappings."""
+    from sqlalchemy import select
+    result = db.execute(select(ModuleAdapterMapping))
+    mappings = result.scalars().all()
+    return [{"module_name": m.module_name, "adapter_name": m.adapter_name, "use_module_dir": m.use_module_dir} for m in mappings]
 
 
-@router.post("/channels", status_code=status.HTTP_201_CREATED)
-async def create_channel(channel: ChannelCreate, db=Depends(get_db)):
-    """Create a storage channel."""
-    if channel.adapter_name not in AdapterRegistry._adapters:
+@router.post("/module-mappings", status_code=status.HTTP_201_CREATED)
+async def create_module_mapping(mapping: ModuleMappingCreate, db=Depends(get_db)):
+    """Create module-to-adapter mapping."""
+    if mapping.adapter_name not in AdapterRegistry._adapters:
         raise HTTPException(status_code=400, detail="Adapter not registered")
-    db_channel = StorageChannel(
-        name=channel.name,
-        adapter_name=channel.adapter_name,
-        description=channel.description,
+    db_mapping = ModuleAdapterMapping(
+        module_name=mapping.module_name,
+        adapter_name=mapping.adapter_name,
+        use_module_dir=mapping.use_module_dir,
+        description=mapping.description,
     )
-    db.add(db_channel)
+    db.add(db_mapping)
     db.commit()
-    return {"name": db_channel.name, "adapter_name": db_channel.adapter_name}
+    return {"module_name": db_mapping.module_name, "adapter_name": db_mapping.adapter_name, "use_module_dir": db_mapping.use_module_dir}
 
 
-@router.get("/policies/{channel}", response_model=Optional[dict])
-async def get_policy(channel: str, db=Depends(get_db)):
-    """Get storage policy for a channel."""
-    result = await db.execute(select(StoragePolicy).where(StoragePolicy.channel == channel))
-    policy = result.scalar_one_or_none()
-    if not policy:
-        return None
-    return {"channel": policy.channel, "adapter_name": policy.adapter_name, "max_file_size": policy.max_file_size}
-
-
-@router.post("/policies/{channel}", status_code=status.HTTP_201_CREATED)
-async def set_policy(channel: str, policy: PolicyCreate, db=Depends(get_db)):
-    """Set or update storage policy for a channel."""
-    if policy.adapter_name not in AdapterRegistry._adapters:
-        raise HTTPException(status_code=400, detail="Adapter not registered")
-    result = await db.execute(select(StoragePolicy).where(StoragePolicy.channel == channel))
-    db_policy = result.scalar_one_or_none()
-    if db_policy:
-        db_policy.adapter_name = policy.adapter_name
-        if policy.max_file_size is not None:
-            db_policy.max_file_size = policy.max_file_size
-    else:
-        db_policy = StoragePolicy(
-            channel=channel,
-            adapter_name=policy.adapter_name,
-            max_file_size=policy.max_file_size or 10485760,
-        )
-        db.add(db_policy)
-    db.commit()
-    return {"channel": db_policy.channel, "adapter_name": db_policy.adapter_name, "max_file_size": db_policy.max_file_size}
-
-
-@router.delete("/policies/{channel}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_policy(channel: str, db=Depends(get_db)):
-    """Delete storage policy for a channel."""
-    result = await db.execute(select(StoragePolicy).where(StoragePolicy.channel == channel))
-    db_policy = result.scalar_one_or_none()
-    if db_policy:
-        db.delete(db_policy)
+@router.delete("/module-mappings/{module_name}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_module_mapping(module_name: str, db=Depends(get_db)):
+    """Delete module-to-adapter mapping."""
+    from sqlalchemy import select
+    result = db.execute(select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name))
+    mapping = result.scalar_one_or_none()
+    if mapping:
+        db.delete(mapping)
         db.commit()
 
 
@@ -197,10 +163,11 @@ async def upload_file(
             filename=file.filename,
             content_type=content_type,
             created_by_module="chacc_file_manager",
+            channel=form.get("channel"),
         )
         db.add(record)
         db.commit()
-        return {"uuid": record.uuid, "filename": record.filename, "size": record.size}
+        return {"uuid": record.uuid, "filename": record.filename, "size": record.size, "storage_key": record.storage_key}
     except (FileTooLargeError, InvalidContentTypeError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 

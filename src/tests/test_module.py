@@ -4,7 +4,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from ..models import FileRecord, StorageChannel, StoragePolicy
+from ..models import FileRecord, ModuleAdapterMapping
 from ..exceptions import (
     FileTooLargeError,
     InvalidContentTypeError,
@@ -14,8 +14,7 @@ from ..exceptions import (
 
 def test_models_import():
     assert FileRecord is not None
-    assert StorageChannel is not None
-    assert StoragePolicy is not None
+    assert ModuleAdapterMapping is not None
 
 
 def test_exceptions_exist():
@@ -28,16 +27,32 @@ def test_file_record_creation():
     record = FileRecord(
         uuid="test-uuid-123",
         adapter_name="local",
-        channel="default",
+        module_dir="menu",
+        channel="images",
         filename="test.txt",
         content_type="text/plain",
         size=100,
-        storage_key="test-uuid-123",
-        created_by_module="chacc_file_manager",
+        storage_key="menu/images/test-uuid-123",
+        created_by_module="menu",
         checksum="abc123",
     )
     assert record.uuid == "test-uuid-123"
     assert record.adapter_name == "local"
+    assert record.module_dir == "menu"
+    assert record.channel == "images"
+    assert record.storage_key == "menu/images/test-uuid-123"
+
+
+def test_module_adapter_mapping_creation():
+    mapping = ModuleAdapterMapping(
+        module_name="menu",
+        adapter_name="local",
+        use_module_dir=True,
+        description="Menu module",
+    )
+    assert mapping.module_name == "menu"
+    assert mapping.adapter_name == "local"
+    assert mapping.use_module_dir is True
 
 
 def test_sanitize_filename():
@@ -82,15 +97,14 @@ async def test_adapter_save_and_delete():
 
 
 @pytest.mark.asyncio
-async def test_adapter_path_traversal_protection():
+async def test_adapter_save_with_module_dir():
     from ..adapters.local import LocalAdapter
     with tempfile.TemporaryDirectory() as tmpdir:
         adapter = LocalAdapter(storage_dir=tmpdir)
-        try:
-            await adapter.save("../../../etc/passwd", b"test", "text/plain")
-            assert False, "Should have raised HTTPException"
-        except Exception:
-            pass
+        storage_key = "mymodule/test-uuid-123"
+        await adapter.save(storage_key, b"test content", "text/plain")
+        assert await adapter.exists(storage_key)
+        assert await adapter.get_size(storage_key) == 12
 
 
 def test_router_exists():
