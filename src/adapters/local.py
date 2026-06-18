@@ -1,0 +1,68 @@
+import aiofiles
+import mimetypes
+import os
+from pathlib import Path
+from typing import Optional
+from fastapi import Request, HTTPException
+
+from .base import BaseAdapter
+
+
+class LocalAdapter(BaseAdapter):
+    name = "local"
+
+    def __init__(self, storage_dir: str):
+        self.storage_dir = Path(storage_dir).resolve()
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_storage_path(self, uuid: str) -> Path:
+        full_path = (self.storage_dir / uuid).resolve()
+        try:
+            full_path.relative_to(self.storage_dir)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid file path")
+        return full_path
+
+    async def save(
+        self,
+        file_uuid: str,
+        content: bytes,
+        content_type: str,
+    ) -> str:
+        full_path = self._get_storage_path(file_uuid)
+        temp_path = self.storage_dir / f".tmp_{file_uuid}"
+
+        try:
+            async with aiofiles.open(temp_path, "wb") as f:
+                await f.write(content)
+            os.rename(str(temp_path), str(full_path))
+            return file_uuid
+        except Exception:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            raise
+
+    async def delete(self, storage_key: str) -> bool:
+        full_path = self._get_storage_path(storage_key)
+        if os.path.exists(full_path):
+            os.remove(full_path)
+            return True
+        return False
+
+    async def exists(self, storage_key: str) -> bool:
+        full_path = self._get_storage_path(storage_key)
+        return os.path.exists(full_path)
+
+    async def get_size(self, storage_key: str) -> int:
+        full_path = self._get_storage_path(storage_key)
+        if not os.path.exists(full_path):
+            raise HTTPException(status_code=404, detail="File not found")
+        return os.path.getsize(full_path)
+
+    async def get_url(self, storage_key: str, request: Request) -> str:
+        url = request.url_for("files:serve", uuid=storage_key)
+        return str(url)
+
+    def _detect_mime_type(self, filename: str) -> str:
+        mime_type, _ = mimetypes.guess_type(filename)
+        return mime_type or "application/octet-stream"
