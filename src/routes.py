@@ -2,7 +2,6 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
-import aiofiles
 import os
 
 from .context_factory import get_db
@@ -85,12 +84,12 @@ async def serve_file(
     adapter = AdapterRegistry.get(record.adapter_name)
     storage_key = str(record.storage_key)
 
-    if not os.path.exists(adapter.storage_dir / storage_key):
+    try:
+        size = await adapter.get_size(storage_key)
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(status_code=404, detail="File not found")
-
-    file_path = adapter.storage_dir / storage_key
-    stat = os.stat(file_path)
-    size = stat.st_size
 
     headers = {
         "Content-Type": record.content_type,
@@ -111,33 +110,15 @@ async def serve_file(
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
         headers["Accept-Ranges"] = "bytes"
 
-        async def range_stream():
-            async with aiofiles.open(file_path, "rb") as f:
-                await f.seek(start)
-                remaining = end - start + 1
-                while remaining > 0:
-                    chunk_size = min(8192, remaining)
-                    data = await f.read(chunk_size)
-                    yield data
-                    remaining -= len(data)
-
         return StreamingResponse(
-            range_stream(),
+            adapter.read_stream(storage_key, start=start, end=end),
             status_code=206,
             headers=headers,
             media_type=record.content_type,
         )
 
-    async def file_stream():
-        async with aiofiles.open(file_path, "rb") as f:
-            while True:
-                chunk = await f.read(8192)
-                if not chunk:
-                    break
-                yield chunk
-
     return StreamingResponse(
-        file_stream(),
+        adapter.read_stream(storage_key),
         headers=headers,
         media_type=record.content_type,
     )

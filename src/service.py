@@ -1,12 +1,14 @@
 import uuid
+import uuid_utils
 import hashlib
 import asyncio
-from typing import Optional, Any
+from typing import Optional, Any, AsyncIterator
+from abc import ABC, abstractmethod
 from fastapi import Request, HTTPException
 from sqlalchemy import select
 
 from .models import FileRecord, ModuleAdapterMapping
-from .adapters.base import AdapterRegistry
+from .adapters.base import AdapterRegistry, BaseAdapter
 from .config import get_config, FileManagerConfig
 from .exceptions import (
     FileTooLargeError,
@@ -21,24 +23,60 @@ def generate_checksum(content: bytes) -> str:
 
 def sanitize_filename(filename: str) -> str:
     safe = "".join(c for c in filename if c.isalnum() or c in "._-")
-    return safe or f"file_{uuid.uuid4().hex}"
+    return safe or f"file_{uuid_utils.uuid7().hex}"
 
 
-class FileService:
+class BaseFileService(ABC):
+    @abstractmethod
+    async def save_file(
+        self,
+        file_content: bytes,
+        filename: str,
+        content_type: str,
+        created_by_module: str,
+        channel: Optional[str] = None,
+        db_session=None,
+        adapter_name: Optional[str] = None,
+    ) -> FileRecord:
+        pass
+
+    @abstractmethod
+    async def get_file(self, file_uuid: str, db_session) -> FileRecord:
+        pass
+
+    @abstractmethod
+    async def delete_file(self, file_uuid: str, db_session) -> bool:
+        pass
+
+    @abstractmethod
+    async def get_download_url(
+        self,
+        file_uuid: str,
+        request: Request,
+        db_session,
+        download: bool = False,
+    ) -> str:
+        pass
+
+
+class FileService(BaseFileService):
     def __init__(self, config: Optional[FileManagerConfig] = None):
         self.config = config or get_config()
 
-    def _resolve_adapter_for_module(self, module_name: str, db_session) -> Any:
-        result = db_session.execute(
-            select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name)
-        )
-        mapping = result.scalar_one_or_none()
-        if mapping and mapping.adapter_name in AdapterRegistry._adapters:
-            return AdapterRegistry.get(mapping.adapter_name), mapping.use_module_dir
+    def _resolve_adapter(self, module_name: str, adapter_name: Optional[str], db_session) -> BaseAdapter:
+        if adapter_name and adapter_name in AdapterRegistry._adapters:
+            return AdapterRegistry.get(adapter_name)
+        if db_session:
+            result = db_session.execute(
+                select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == module_name)
+            )
+            mapping = result.scalar_one_or_none()
+            if mapping and mapping.adapter_name in AdapterRegistry._adapters:
+                return AdapterRegistry.get(mapping.adapter_name)
         adapter = AdapterRegistry.get_default()
         if not adapter:
-            raise ValueError(f"No default adapter registered for module '{module_name}'")
-        return adapter, False
+            raise ValueError(f"No adapter registered for module '{module_name}'")
+        return adapter
 
     async def save_file(
         self,
@@ -50,22 +88,21 @@ class FileService:
         db_session=None,
         adapter_name: Optional[str] = None,
     ) -> FileRecord:
-        if adapter_name and adapter_name in AdapterRegistry._adapters:
-            adapter = AdapterRegistry.get(adapter_name)
-            use_module_dir = False
-        elif db_session:
-            adapter, use_module_dir = self._resolve_adapter_for_module(created_by_module, db_session)
-        else:
-            adapter = AdapterRegistry.get_default()
-            if not adapter:
-                raise ValueError("No adapter registered")
-            use_module_dir = False
+        adapter = self._resolve_adapter(created_by_module, adapter_name, db_session)
 
-        file_uuid = str(uuid.uuid4())
+        file_uuid = str(uuid_utils.uuid7())
         safe_filename = sanitize_filename(filename)
         checksum = generate_checksum(file_content)
 
         storage_key = file_uuid
+        mapping = None
+        if db_session:
+            result = db_session.execute(
+                select(ModuleAdapterMapping).where(ModuleAdapterMapping.module_name == created_by_module)
+            )
+            mapping = result.scalar_one_or_none()
+        use_module_dir = bool(mapping and mapping.use_module_dir)
+
         if use_module_dir:
             storage_key = f"{created_by_module}/{storage_key}"
             if channel:

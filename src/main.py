@@ -7,8 +7,9 @@ import os
 from .routes import router as chacc_file_manager_router
 from .context_factory import get_context, set_module_context
 from .adapters.local import LocalAdapter
-from .adapters.base import AdapterRegistry
+from .adapters.base import AdapterRegistry, BaseAdapter
 from .config import get_config
+from .service import FileService
 
 
 health_router = APIRouter()
@@ -53,10 +54,35 @@ def setup_plugin(context: Optional[BackboneContext] = None):
     except Exception as e:
         _module_context.logger.warning(f"chacc_file_manager: Failed to init storage: {e}")
 
-    _module_context.register_service("file_service", lambda: None)
+    _module_context.register_service("file_service", FileService())
+    _module_context.register_service("register_file_adapter", register_file_adapter)
+    _module_context.register_service("file_base_adapter", BaseAdapter)
 
     chacc_file_manager_router.include_router(health_router)
     return chacc_file_manager_router
+
+
+def register_file_adapter(adapter: BaseAdapter, name=None, description=None):
+    adapter_name = name or getattr(adapter, "name", None)
+    if not adapter_name:
+        raise ValueError("Adapter must have a name")
+    _validate_adapter(adapter)
+    AdapterRegistry.register(adapter, name=adapter_name, set_default=False)
+    return adapter_name
+
+
+def _validate_adapter(adapter):
+    required_methods = [
+        "save", "delete", "exists", "get_size", "get_url", "read_stream", "health_check"
+    ]
+    missing = [m for m in required_methods if not hasattr(adapter, m)]
+    if missing:
+        raise TypeError(f"Adapter missing required methods: {', '.join(missing)}")
+
+    for method_name in required_methods:
+        method = getattr(adapter, method_name)
+        if not callable(method):
+            raise TypeError(f"Adapter.{method_name} is not callable")
 
 
 def get_plugin_info():

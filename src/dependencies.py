@@ -1,8 +1,4 @@
-from typing import Optional
-from fastapi import HTTPException, Depends, Request
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-
-from .context_factory import get_module_context, get_db, security
+from .context_factory import get_module_context
 
 
 async def get_file_service():

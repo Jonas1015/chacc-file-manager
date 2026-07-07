@@ -30,7 +30,8 @@ class LocalAdapter(BaseAdapter):
         content_type: str,
     ) -> str:
         full_path = self._get_storage_path(file_uuid)
-        temp_path = self.storage_dir / f".tmp_{file_uuid}"
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = full_path.parent / f".tmp_{full_path.name}"
 
         try:
             async with aiofiles.open(temp_path, "wb") as f:
@@ -66,3 +67,20 @@ class LocalAdapter(BaseAdapter):
     def _detect_mime_type(self, filename: str) -> str:
         mime_type, _ = mimetypes.guess_type(filename)
         return mime_type or "application/octet-stream"
+
+    async def read_stream(self, storage_key: str, start: int = 0, end: Optional[int] = None):
+        full_path = self._get_storage_path(storage_key)
+        async with aiofiles.open(full_path, "rb") as f:
+            if start > 0:
+                await f.seek(start)
+            remaining = (end - start + 1) if end is not None else None
+            while True:
+                if remaining is not None and remaining <= 0:
+                    break
+                chunk_size = min(8192, remaining) if remaining is not None else 8192
+                data = await f.read(chunk_size)
+                if not data:
+                    break
+                yield data
+                if remaining is not None:
+                    remaining -= len(data)

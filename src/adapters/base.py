@@ -40,6 +40,11 @@ class BaseAdapter(ABC):
         """Check adapter health."""
         return True
 
+    @abstractmethod
+    async def read_stream(self, storage_key: str, start: int = 0, end: Optional[int] = None):
+        """Return an async iterator over file bytes, optionally bounded by start/end."""
+        pass
+
 
 class AdapterRegistry:
     _adapters: dict = {}
