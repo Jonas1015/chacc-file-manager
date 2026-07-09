@@ -160,12 +160,12 @@ Modules don't call this - administrators configure it. Modules only use their id
 ## Directory Storage Logic
 
 ```mermaid
-flowchart TD
-    A[save_file called] --> B{use_module_dir?}
-    B -->|No| C[STORAGE_DIR/{uuid}]
-    B -->|Yes| D{channel provided?}
-    D -->|No| E[STORAGE_DIR/{module_name}/{uuid}]
-    D -->|Yes| F[STORAGE_DIR/{module_name}/{channel}/{uuid}]
+flowchart TB
+    A["save_file called"] --> B{"use_module_dir?"}
+    B -->|No| C["STORAGE_DIR/\{uuid\}"]
+    B -->|Yes| D{"channel provided?"}
+    D -->|No| E["STORAGE_DIR/{module_name}/{uuid}"]
+    D -->|Yes| F["STORAGE_DIR/{module_name}/{channel}/{uuid}"]
 ```
 
 Examples:
