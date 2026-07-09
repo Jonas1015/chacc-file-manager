@@ -69,13 +69,6 @@ def test_checksum_generation():
     assert len(checksum) == 64
 
 
-def test_config():
-    from ..config import get_config
-    config = get_config()
-    assert config.STORAGE_DIR is not None
-    assert config.MAX_FILE_SIZE > 0
-
-
 def test_local_adapter():
     from ..adapters.local import LocalAdapter
     with tempfile.TemporaryDirectory() as tmpdir:

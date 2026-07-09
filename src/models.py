@@ -14,7 +14,6 @@ class FileStatus(str, Enum):
 class FileRecord(ChaCCBaseModel):
     __tablename__ = "file_records"
 
-    uuid = Column(String(36), primary_key=True, index=True)
     adapter_name = Column(String(100), nullable=False)
     module_dir = Column(String(100), nullable=True)
     channel = Column(String(100), nullable=True)

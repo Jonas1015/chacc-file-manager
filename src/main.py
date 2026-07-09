@@ -5,10 +5,9 @@ from typing import Optional
 import os
 
 from .routes import router as chacc_file_manager_router
-from .context_factory import get_context, set_module_context
+from .context_factory import get_context, set_module_context, get_module_context
 from .adapters.local import LocalAdapter
 from .adapters.base import AdapterRegistry, BaseAdapter
-from .config import get_config
 from .service import FileService
 
 
@@ -18,8 +17,11 @@ health_router = APIRouter()
 @health_router.get("/health")
 async def health_check():
     """Health check endpoint for the module."""
-    config = get_config()
-    storage_path = config.STORAGE_DIR
+    context = get_module_context()
+    if context is not None:
+        storage_path = context.get_module_config("STORAGE_DIR", "chacc_file_manager", default="/tmp/chacc_file_storage")
+    else:
+        storage_path = "/tmp/chacc_file_storage"
 
     if not os.path.exists(storage_path):
         return JSONResponse(
@@ -46,9 +48,11 @@ def setup_plugin(context: Optional[BackboneContext] = None):
 
     _module_context.logger.info("chacc_file_manager: Setup initiated!")
 
-    config = get_config()
+    storage_dir = _module_context.get_module_config(
+        "STORAGE_DIR", "chacc_file_manager", default="uploads/"
+    )
     try:
-        local_adapter = LocalAdapter(storage_dir=config.STORAGE_DIR)
+        local_adapter = LocalAdapter(storage_dir=storage_dir)
         AdapterRegistry.register(local_adapter, name="local", set_default=True)
         _module_context.logger.info("chacc_file_manager: Local adapter registered")
     except Exception as e:
