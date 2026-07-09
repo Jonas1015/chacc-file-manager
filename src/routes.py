@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 import os
 
-from .context_factory import get_db
+from .context_factory import get_db, get_module_context
 from .models import FileRecord, ModuleAdapterMapping
 from .service import FileService
 from .adapters.base import AdapterRegistry
@@ -91,10 +91,17 @@ async def serve_file(
     except Exception:
         raise HTTPException(status_code=404, detail="File not found")
 
+    context = get_module_context()
+    cache_max_age = (
+        context.get_module_config("FILE_CACHE_MAX_AGE", "chacc_file_manager", default=0)
+        if context
+        else 3600
+    )
+
     headers = {
         "Content-Type": record.content_type,
         "Content-Disposition": f'inline; filename="{record.filename}"' if not download else f'attachment; filename="{record.filename}"',
-        "Cache-Control": "public, max-age=31536000, immutable",
+        "Cache-Control": f"public, max-age={cache_max_age}",
         "ETag": f'"{record.checksum}"' if record.checksum else None,
     }
 

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional, Union, AsyncIterable, List, Callable, Awaitable
 from abc import ABC, abstractmethod
 from fastapi import Request, UploadFile
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -230,7 +231,7 @@ class FileService(BaseFileService):
         validation_is_path = False
         temp_path = None
 
-        if isinstance(file, UploadFile):
+        if isinstance(file, StarletteUploadFile):
             if file.size is not None and file.size <= stream_threshold:
                 file_size = file.size
                 content_bytes = await file.read()
