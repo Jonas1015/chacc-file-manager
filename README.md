@@ -356,7 +356,7 @@ CHACC_FILE_MANAGER_MAX_FILE_SIZE=52428800
 CHACC_FILE_MANAGER_STREAM_THRESHOLD=10485760
 CHACC_FILE_MANAGER_UPLOAD_CHUNK_SIZE=65536
 CHACC_FILE_MANAGER_ALLOWED_CONTENT_TYPES=image/jpeg,image/png,application/pdf
-CHACC_FILE_MANAGER_FILE_CACHE_MAX_AGE=0
+CHACC_FILE_MANAGER_FILE_CACHE_MAX_AGE=300
 ```
 
 | Variable | Default | Description |
@@ -366,7 +366,7 @@ CHACC_FILE_MANAGER_FILE_CACHE_MAX_AGE=0
 | `STREAM_THRESHOLD` | `10485760` | Files larger than this are streamed to a temp file instead of loaded into memory (10 MB). |
 | `UPLOAD_CHUNK_SIZE` | `8192` | Bytes to read per chunk when streaming from `UploadFile`. |
 | `ALLOWED_CONTENT_TYPES` | `""` (allow all) | Comma-separated MIME types allowed. Empty means no restriction. |
-| `FILE_CACHE_MAX_AGE` | `3600` | `Cache-Control` `max-age` (seconds) for served files. `immutable` is intentionally omitted so clients revalidate via `ETag` — deletions take effect on next revalidation. Set to `0` to effectively disable caching. |
+| `FILE_CACHE_MAX_AGE` | `300` | `Cache-Control` `max-age` (seconds) for served files. `immutable` is intentionally omitted so clients revalidate via `ETag` — deletions take effect on next revalidation. Set to `0` to effectively disable caching. |
 
 ### Determining the right thresholds
 

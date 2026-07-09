@@ -93,7 +93,7 @@ async def serve_file(
 
     context = get_module_context()
     cache_max_age = (
-        context.get_module_config("FILE_CACHE_MAX_AGE", "chacc_file_manager", default=0)
+        context.get_module_config("FILE_CACHE_MAX_AGE", "chacc_file_manager", default=300)
         if context
         else 3600
     )
