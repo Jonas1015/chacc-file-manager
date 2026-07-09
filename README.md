@@ -1,6 +1,6 @@
 # ChaccFileManager Module
 
-Enterprise-grade, adapter-based file management for ChaCC. Files are addressed by UUID, stored through pluggable adapters, and tracked in the database with deduplication, validation hooks, and configurable streaming behavior.
+The adapter-based file management for ChaCC API. Files are addressed by UUID, stored through pluggable adapters, and tracked in the database with deduplication, validation hooks, and configurable streaming behavior.
 
 ## What This Module Does
 
@@ -36,7 +36,7 @@ classDiagram
 
     class BaseAdapter {
         <<abstract>>
-        +save(file_uuid, content, content_type) dict
+        +save(storage_key, content, content_type) dict
         +delete(storage_key) bool
         +exists(storage_key) bool
         +get_size(storage_key) int
@@ -46,7 +46,7 @@ classDiagram
 
     class LocalAdapter {
         +storage_dir: Path
-        +save(file_uuid, content, content_type) dict
+        +save(storage_key, content, content_type) dict
         +delete(storage_key) bool
         +exists(storage_key) bool
         +get_size(storage_key) int
@@ -115,17 +115,51 @@ record = await file_service.save_file(
     file=upload_file,          # UploadFile | bytes | AsyncIterable[bytes]
     filename="photo.jpg",
     content_type="image/jpeg",
-    created_by_module="menu",
+    created_by_module="menu",  # identifies which ChaCC module owns the file
+    created_by_user_id=current_user.id,  # Optional: track ownership per user
     channel="images",          # optional, only used if module mapping sets use_module_dir=true
     db_session=db,
 )
-
-url = await file_service.get_download_url(
-    file_uuid=record.uuid,
-    request=request,
-    db_session=db,
-)
 ```
+
+`created_by_module` identifies which ChaCC module owns the file. This is used for deduplication (files are deduplicated per module), adapter routing (modules can be mapped to different storage backends), and storage organization (module directories). It is not a user ID—use `created_by_user_id` for user-level ownership.
+
+## Serving Files
+
+Once a file is uploaded, its content can be served directly via the built-in endpoint:
+
+```http
+GET /files/019f45a2-35fa-7682-ba04-3c2c5e1d1163/content
+```
+
+The endpoint handles:
+- `Content-Disposition: inline` by default (for `<img>`, `<video>` tags)
+- `?download=1` forces `Content-Disposition: attachment` (download prompt)
+- `Range` headers for partial content (video seeking, resumable downloads)
+- `ETag` and `Cache-Control` headers (1-year immutable cache)
+
+No custom route is needed. The file manager provides this endpoint automatically.
+
+## Installation
+
+As a ChaCC module, the file manager is installed like any other plugin:
+
+```bash
+chacc add chacc-file-manager
+```
+
+Or if building from source:
+
+```bash
+chacc build chacc-file-manager.chacc
+```
+
+After installation, the file service is available via:
+```python
+file_service = get_module_context().get_service("file_service")
+```
+
+The module requires `aiofiles`, `uuid_utils`, `sqlalchemy`, and `fastapi`. These will be installed automatically when you add the module via `chacc add`.
 
 ## Unified `file` Parameter
 
@@ -144,21 +178,38 @@ Optional async hooks run **before** duplicate checking and before `adapter.save(
 - `metadata`: always `{}` at this stage (adapter has not run yet)
 - `is_path`: `True` if `payload` is a `Path`
 
+The metadata returned by `adapter.save()` is passed to validation hooks (as the `metadata` parameter) and stored in the `FileRecord` table. You can use it to store backend-specific information like S3 keys, CDN URLs, or custom file IDs.
+
+Hooks should not rely on `metadata` at this stage because `adapter.save()` has not executed yet.
+
 ```python
+import io
+from PIL import Image
+
 async def require_image_dimensions(payload, metadata, is_path):
     if is_path:
-        data = await aiofiles.os.path.getsize(payload)
+        # Read the file asynchronously
+        async with aiofiles.open(payload, "rb") as f:
+            data = await f.read()
     else:
         data = payload
+    
     image = Image.open(io.BytesIO(data))
     if image.width < 800 or image.height < 600:
         raise ValueError("Image too small")
-
-record = await file_service.save_file(
-    ...
-    validation_hooks=[require_image_dimensions],
-)
 ```
+
+## Error Handling
+
+`save_file()` raises the following exceptions:
+
+- `FileTooLargeError` — File exceeds `MAX_FILE_SIZE`.
+- `InvalidContentTypeError` — Content type not in `ALLOWED_CONTENT_TYPES`.
+- `ValueError` — `db_session` is `None`.
+- `TypeError` — Stream yields non-bytes chunks.
+- Any exception raised by validation hooks (wrapped in `await hook(...)`).
+
+**Module developers should catch exceptions at the route layer and return appropriate HTTP responses.**
 
 ## Deduplication
 
@@ -183,7 +234,7 @@ An adapter is any object implementing these methods. It does **not** need to inh
 
 | Method | Signature | Returns | Notes |
 |--------|-----------|---------|-------|
-| `save` | `(file_uuid: str, content: Union[bytes, Path], content_type: str) -> dict` | `dict` | Returns adapter metadata. Local adapter returns `{"storage_key": ..., "adapter": ...}`. |
+| `save` | `(storage_key: str, content: Union[bytes, Path], content_type: str) -> dict` | `dict` | Returns adapter metadata. `storage_key` is built by the service from UUID + optional module/channel paths. |
 | `delete` | `(storage_key: str) -> bool` | `bool` | `True` if successful. |
 | `exists` | `(storage_key: str) -> bool` | `bool` | |
 | `get_size` | `(storage_key: str) -> int` | `int` | Size in bytes. |
@@ -222,7 +273,7 @@ Copy this into your module for IDE support. It is not imported at runtime.
 class BaseAdapter:
     name: str = "base"
 
-    async def save(self, file_uuid: str, content, content_type: str) -> dict:
+    async def save(self, storage_key: str, content, content_type: str) -> dict:
         raise NotImplementedError
 
     async def delete(self, storage_key: str) -> bool:
@@ -234,7 +285,7 @@ class BaseAdapter:
     async def get_size(self, storage_key: str) -> int:
         raise NotImplementedError
 
-    async def get_url(self, storage_key: str, request) -> str:
+    async def get_url(self, storage_key: str, request) -> str: # request is unused but required by contrac
         raise NotImplementedError
 
     async def read_stream(self, storage_key: str, start: int = 0, end=None):
@@ -255,6 +306,9 @@ BaseAdapter = cast(type[BaseAdapter], _base_adapter_class)
 ## Example: S3 Adapter
 
 ```python
+import asyncio
+from pathlib import Path
+
 class S3Adapter(BaseAdapter):
     name = "s3"
 
@@ -262,13 +316,13 @@ class S3Adapter(BaseAdapter):
         self.bucket = bucket
         self.client = client
 
-    async def save(self, file_uuid, content, content_type):
-        key = f"uploads/{file_uuid}"
+    async def save(self, storage_key, content, content_type):
+        key = f"uploads/{storage_key}"
+        loop = asyncio.get_running_loop()
         if isinstance(content, Path):
-            await self.client.upload_from_path(self.bucket, key, content)
+            await loop.run_in_executor(None, self.client.upload_from_path, self.bucket, key, str(content))
         else:
-            await self.client.upload_bytes(self.bucket, key, content, content_type)
-        return {"storage_key": file_uuid, "adapter": self.name, "s3_key": key}
+            await loop.run_in_executor(None, self.client.upload_bytes, self.bucket, key, content, content_type)
 
     async def delete(self, storage_key):
         await self.client.delete(self.bucket, f"uploads/{storage_key}")
@@ -344,7 +398,7 @@ Resolution order:
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/files/` | POST | Admin/Module | Upload a file (`multipart/form-data` with `file` field, optional `channel`) |
-| `/files/{uuid}/content` | GET | Public | Serve file content by UUID |
+| `/files/{uuid}/content` | GET | Public (no built-in auth) | Serve file content by UUID. If you need access control, implement it at the route layer. |
 | `/files/{uuid}/content?download=1` | GET | Public | Download with `Content-Disposition: attachment` |
 | `/files/{uuid}` | DELETE | Admin/Module | Soft-delete a file by UUID |
 
