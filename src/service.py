@@ -1,16 +1,23 @@
+import aiofiles
 import uuid_utils
 import hashlib
 import asyncio
-from typing import Optional
+import tempfile
+import os
+from pathlib import Path
+from typing import Optional, Union, AsyncIterable, List, Callable, Awaitable
 from abc import ABC, abstractmethod
-from fastapi import Request
+from fastapi import Request, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .context_factory import get_module_context
 from .models import FileRecord, ModuleAdapterMapping
 from .adapters.base import AdapterRegistry, BaseAdapter
 from .exceptions import (
     FileNotFoundError as FileNotFound,
+    InvalidContentTypeError,
+    FileTooLargeError,
 )
 
 
@@ -27,13 +34,15 @@ class BaseFileService(ABC):
     @abstractmethod
     async def save_file(
         self,
-        file_content: bytes,
+        file: Union[UploadFile, bytes, AsyncIterable[bytes]],
         filename: str,
         content_type: str,
         created_by_module: str,
         channel: Optional[str] = None,
-        db_session=None,
+        db_session: Session = None,
         adapter_name: Optional[str] = None,
+        created_by_user_id: Optional[int] = None,
+        validation_hooks: Optional[List[Callable[[Union[bytes, Path], dict, bool], Awaitable[None]]]] = None,
     ) -> FileRecord:
         pass
 
@@ -53,6 +62,10 @@ class BaseFileService(ABC):
         db_session,
         download: bool = False,
     ) -> str:
+        pass
+
+    @abstractmethod
+    async def register_adapter(self, adapter: BaseAdapter, name: str, set_default: bool = False):
         pass
 
 
@@ -81,23 +94,128 @@ class FileService(BaseFileService):
             raise ValueError(f"No adapter registered for module '{module_name}'")
         return adapter, None
 
+    async def _process_bytes(
+        self,
+        content: bytes,
+        max_file_size: int,
+    ) -> tuple[str, int, bytes]:
+        if len(content) > max_file_size:
+            raise FileTooLargeError(f"File exceeds {max_file_size} bytes limit")
+
+        checksum = await asyncio.to_thread(generate_checksum, content)
+        return checksum, len(content), content
+
+    async def _process_stream(
+        self,
+        stream: AsyncIterable[bytes],
+        max_file_size: int,
+    ) -> tuple[str, int, Path]:
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".upload") as tmp:
+                temp_path = Path(tmp.name)
+
+            sha = hashlib.sha256()
+            file_size = 0
+            async with aiofiles.open(temp_path, "wb") as af:
+                async for chunk in stream:
+                    if not isinstance(chunk, bytes):
+                        raise TypeError("Stream must yield bytes")
+                    file_size += len(chunk)
+                    if file_size > max_file_size:
+                        raise FileTooLargeError(f"File exceeds {max_file_size} bytes limit")
+                    sha.update(chunk)
+                    await af.write(chunk)
+
+            checksum = sha.hexdigest()
+            return checksum, file_size, temp_path
+        except Exception:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+            raise
+
+    async def _check_duplicate(
+        self, db_session: Session, checksum: str, created_by_module: str
+    ) -> Optional[FileRecord]:
+        def _query():
+            result = db_session.execute(
+                select(FileRecord).where(
+                    FileRecord.checksum == checksum,
+                    FileRecord.created_by_module == created_by_module,
+                )
+            )
+            return result.scalar_one_or_none()
+
+        return await asyncio.to_thread(_query)
+
+    def _get_config(self) -> dict:
+        context = get_module_context()
+        if context is None:
+            return {
+                "max_file_size": 10 * 1024 * 1024,
+                "stream_threshold": 10 * 1024 * 1024,
+                "chunk_size": 8192,
+                "allowed_content_types": set(),
+            }
+
+        max_file_size = context.get_module_config(
+            "MAX_FILE_SIZE", "chacc_file_manager", default=10 * 1024 * 1024
+        )
+        stream_threshold = context.get_module_config(
+            "STREAM_THRESHOLD", "chacc_file_manager", default=10 * 1024 * 1024
+        )
+        chunk_size = context.get_module_config(
+            "UPLOAD_CHUNK_SIZE", "chacc_file_manager", default=8192
+        )
+        allowed_types_str = context.get_module_config(
+            "ALLOWED_CONTENT_TYPES", "chacc_file_manager", default=""
+        )
+        allowed_types = (
+            {t.strip() for t in allowed_types_str.split(",") if t.strip()}
+            if allowed_types_str
+            else set()
+        )
+        return {
+            "max_file_size": max_file_size,
+            "stream_threshold": stream_threshold,
+            "chunk_size": chunk_size,
+            "allowed_content_types": allowed_types,
+        }
+
     async def save_file(
         self,
-        file_content: bytes,
+        file: Union[UploadFile, bytes, AsyncIterable[bytes]],
         filename: str,
         content_type: str,
         created_by_module: str,
         channel: Optional[str] = None,
         db_session: Session = None,
         adapter_name: Optional[str] = None,
+        created_by_user_id: Optional[int] = None,
+        validation_hooks: Optional[List[Callable[[Union[bytes, Path], dict, bool], Awaitable[None]]]] = None,
     ) -> FileRecord:
         if db_session is None:
-            raise ValueError("Database session is required to save file record")
+            raise ValueError("Database session is required")
 
-        adapter, mapping = await self._resolve_adapter(created_by_module, adapter_name, db_session)
+        config = self._get_config()
+        max_file_size = config["max_file_size"]
+        stream_threshold = config["stream_threshold"]
+        chunk_size = config["chunk_size"]
+        allowed_content_types = config["allowed_content_types"]
+
+        if allowed_content_types and content_type not in allowed_content_types:
+            raise InvalidContentTypeError(
+                f"Content type '{content_type}' is not allowed"
+            )
+
+        adapter, mapping = await self._resolve_adapter(
+            created_by_module, adapter_name, db_session
+        )
         file_uuid = str(uuid_utils.uuid7())
         safe_filename = sanitize_filename(filename)
-        checksum = generate_checksum(file_content)
 
         use_module_dir = bool(mapping and mapping.use_module_dir)
         storage_key = file_uuid
@@ -106,11 +224,93 @@ class FileService(BaseFileService):
             if channel:
                 storage_key = f"{created_by_module}/{channel}/{storage_key}"
 
-        await adapter.save(
-            file_uuid=storage_key,
-            content=file_content,
-            content_type=content_type,
-        )
+        checksum = None
+        file_size = None
+        validation_payload = None
+        validation_is_path = False
+        temp_path = None
+
+        if isinstance(file, UploadFile):
+            if file.size is not None and file.size <= stream_threshold:
+                file_size = file.size
+                content_bytes = await file.read()
+                checksum, file_size, content_bytes = await self._process_bytes(
+                    content_bytes, max_file_size
+                )
+                validation_payload = content_bytes
+                validation_is_path = False
+            else:
+                async def _stream_reader():
+                    remaining = None if file.size is None else file.size
+                    while True:
+                        chunk = await file.read(chunk_size)
+                        if not chunk:
+                            break
+                        if remaining is not None:
+                            remaining -= len(chunk)
+                            if remaining < 0:
+                                raise FileTooLargeError(f"File exceeds {max_file_size} bytes limit")
+                        yield chunk
+
+                checksum, file_size, temp_path = await self._process_stream(
+                    _stream_reader(), max_file_size
+                )
+                validation_payload = temp_path
+                validation_is_path = True
+        elif isinstance(file, bytes):
+            checksum, file_size, content_bytes = await self._process_bytes(
+                file, max_file_size
+            )
+            validation_payload = content_bytes
+            validation_is_path = False
+        else:
+            checksum, file_size, temp_path = await self._process_stream(
+                file, max_file_size
+            )
+            validation_payload = temp_path
+            validation_is_path = True
+
+        for hook in (validation_hooks or []):
+            await hook(validation_payload, {}, validation_is_path)
+
+        existing = await self._check_duplicate(db_session, checksum, created_by_module)
+        if existing:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except Exception:
+                    pass
+
+            new_record = FileRecord(
+                uuid=str(uuid_utils.uuid7()),
+                adapter_name=existing.adapter_name,
+                module_dir=existing.module_dir,
+                channel=existing.channel,
+                filename=safe_filename,
+                content_type=content_type,
+                size=file_size,
+                storage_key=existing.storage_key,
+                created_by_module=created_by_module,
+                checksum=checksum,
+            )
+            if hasattr(new_record, "created_by_id"):
+                new_record.created_by_id = created_by_user_id
+
+            db_session.add(new_record)
+            db_session.flush()
+            db_session.refresh(new_record)
+            return new_record
+
+        if temp_path and os.path.exists(temp_path):
+            metadata = await adapter.save(storage_key, temp_path, content_type)
+        else:
+            metadata = await adapter.save(storage_key, validation_payload, content_type)
+
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
 
         record = FileRecord(
             uuid=file_uuid,
@@ -119,28 +319,18 @@ class FileService(BaseFileService):
             channel=channel if use_module_dir else None,
             filename=safe_filename,
             content_type=content_type,
-            size=len(file_content),
+            size=file_size,
             storage_key=storage_key,
             created_by_module=created_by_module,
             checksum=checksum,
         )
+        if hasattr(record, "created_by_id"):
+            record.created_by_id = created_by_user_id
 
-        def _commit_and_refresh():
-            db_session.add(record)
-            db_session.commit()
-            db_session.refresh(record)
-            return record
-
-        try:
-            saved_record = await asyncio.to_thread(_commit_and_refresh)
-            return saved_record
-        except Exception:
-            try:
-                await adapter.delete(storage_key)
-            except Exception:
-                pass
-            db_session.rollback()
-            raise
+        db_session.add(record)
+        db_session.flush()
+        db_session.refresh(record)
+        return record
 
     async def get_file(self, file_uuid: str, db_session) -> FileRecord:
         def _do():
@@ -148,6 +338,7 @@ class FileService(BaseFileService):
                 select(FileRecord).where(FileRecord.uuid == file_uuid)
             )
             return result.scalar_one_or_none()
+
         record = await asyncio.to_thread(_do)
         if record is None:
             raise FileNotFound(f"File {file_uuid} not found")
@@ -175,7 +366,7 @@ class FileService(BaseFileService):
             ).scalar_one_or_none()
             if target:
                 db_session.delete(target)
-                db_session.commit()
+                db_session.flush()
             return True
 
         return await asyncio.to_thread(_delete_and_commit, file_uuid)
@@ -190,3 +381,6 @@ class FileService(BaseFileService):
         record = await self.get_file(file_uuid, db_session)
         adapter = AdapterRegistry.get(record.adapter_name)
         return await adapter.get_url(record.storage_key, request)
+
+    async def register_adapter(self, adapter: BaseAdapter, name: str, set_default: bool = False):
+        AdapterRegistry.register(adapter, name=name, set_default=set_default)

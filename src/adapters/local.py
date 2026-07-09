@@ -2,7 +2,7 @@ import aiofiles
 import mimetypes
 import os
 from pathlib import Path
-from typing import Optional
+from typing import AsyncIterable, Optional, Union
 from fastapi import Request, HTTPException
 
 from .base import BaseAdapter
@@ -15,8 +15,8 @@ class LocalAdapter(BaseAdapter):
         self.storage_dir = Path(storage_dir).resolve()
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
-    def _get_storage_path(self, uuid: str) -> Path:
-        full_path = (self.storage_dir / uuid).resolve()
+    def _get_storage_path(self, storage_key: str) -> Path:
+        full_path = (self.storage_dir / storage_key).resolve()
         try:
             full_path.relative_to(self.storage_dir)
         except ValueError:
@@ -26,23 +26,26 @@ class LocalAdapter(BaseAdapter):
     async def save(
         self,
         file_uuid: str,
-        content: bytes,
+        content: Union[bytes, Path],
         content_type: str,
-    ) -> str:
+    ) -> dict:
         full_path = self._get_storage_path(file_uuid)
         full_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = full_path.parent / f".tmp_{full_path.name}"
 
         try:
-            async with aiofiles.open(temp_path, "wb") as f:
-                await f.write(content)
+            if isinstance(content, bytes):
+                async with aiofiles.open(temp_path, "wb") as f:
+                    await f.write(content)
+            else:
+                content.rename(temp_path)
             os.rename(str(temp_path), str(full_path))
-            return file_uuid
+            return {"storage_key": file_uuid, "adapter": self.name}
         except Exception:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             raise
-
+        
     async def delete(self, storage_key: str) -> bool:
         full_path = self._get_storage_path(storage_key)
         if os.path.exists(full_path):

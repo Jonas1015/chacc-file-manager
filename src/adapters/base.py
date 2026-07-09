@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Union
+from pathlib import Path
 from fastapi import Request
 
 
@@ -10,10 +11,10 @@ class BaseAdapter(ABC):
     async def save(
         self,
         file_uuid: str,
-        content: bytes,
+        content: Union[bytes, Path],
         content_type: str,
-    ) -> str:
-        """Save content to storage. Returns storage key."""
+    ) -> dict:
+        """Save content to storage. Returns metadata dict."""
         pass
 
     @abstractmethod

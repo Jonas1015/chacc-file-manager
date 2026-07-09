@@ -1,6 +1,13 @@
 # ChaccFileManager Module
 
-A ChaCC plugin module providing secure, UUID-addressed file management with adapter-based storage.
+Enterprise-grade, adapter-based file management for ChaCC. Files are addressed by UUID, stored through pluggable adapters, and tracked in the database with deduplication, validation hooks, and configurable streaming behavior.
+
+## What This Module Does
+
+- Accepts uploads from any module via a single unified `save_file(file, ...)` API
+- Stores metadata in `file_records` and delegates bytes/paths to adapters
+- Serves files with range-request support and cache-friendly headers
+- Lets administrators route modules to different adapters at runtime
 
 ## Architecture
 
@@ -29,27 +36,30 @@ classDiagram
 
     class BaseAdapter {
         <<abstract>>
-        +save(file_uuid, content, content_type) str
+        +save(file_uuid, content, content_type) dict
         +delete(storage_key) bool
         +exists(storage_key) bool
         +get_size(storage_key) int
-        +get_url(storage_key) str
+        +get_url(storage_key, request) str
+        +read_stream(storage_key, start, end) AsyncIterator
     }
 
     class LocalAdapter {
         +storage_dir: Path
-        +save(file_uuid, content, content_type) str
+        +save(file_uuid, content, content_type) dict
         +delete(storage_key) bool
         +exists(storage_key) bool
         +get_size(storage_key) int
-        +get_url(storage_key) str
+        +get_url(storage_key, request) str
+        +read_stream(storage_key, start, end) AsyncIterator
     }
 
     class FileService {
-        +save_file(file_content, filename, content_type, created_by_module) FileRecord
+        +save_file(file, filename, content_type, created_by_module, ...) FileRecord
         +get_file(file_uuid, db_session) FileRecord
         +delete_file(file_uuid, db_session) bool
-        +get_download_url(file_uuid) str
+        +get_download_url(file_uuid, request, db_session) str
+        +register_adapter(adapter, name, set_default) void
     }
 
     class AdapterRegistry {
@@ -63,159 +73,53 @@ classDiagram
     BaseAdapter <|-- LocalAdapter
     FileService --> AdapterRegistry
     FileService --> FileRecord
+    FileService ..> BaseAdapter : uses
 ```
 
-## Design Choices
-
-### UUID-Based Storage
-- **Files are stored using their UUID as the filename** (in `storage_key`)
-- Original `filename` stored separately for download display
-- Path obfuscation - users never know actual file location
-
-### Security Features
-- Path traversal protection via `_get_storage_path()` validation
-- Files stored in configured `STORAGE_DIR` with resolved paths
-- No filesystem path exposure in API responses
-
-### Module Directory Organization
-- `use_module_dir` flag in ModuleAdapterMapping controls module subdirectory
-- If enabled: files stored in `STORAGE_DIR/{module_name}/...`
-- If disabled: files stored flat in `STORAGE_DIR/...`
-
-### Channel as Subdirectory
-- `channel` is an optional subdirectory **inside module directory**
-- Only used when `use_module_dir=true`
-- If `use_module_dir=false`, channel is ignored
-
-### Streaming Performance
-- Async file streaming using `aiofiles`
-- Range request support (206 Partial Content)
-- Streams prevent loading entire files into memory
-
-### Headers for HTML/Media
-- `Content-Disposition: inline` by default (for `<img>`, `<video>` tags)
-- `Cache-Control: public, max-age=31536000, immutable`
-- ETag based on SHA-256 checksum
-
-## API Endpoints
-
-### File Operations
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/files/` | POST | Upload a file (multipart form with `file` field) |
-| `/files/{uuid}/content` | GET | Serve file content by UUID |
-| `/files/{uuid}/content?download=1` | GET | Download with attachment disposition |
-| `/files/{uuid}` | DELETE | Delete a file by UUID |
-
-### Metadata Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/files/adapters` | GET | List all registered adapters |
-| `/files/adapters/{name}` | GET | Get adapter info |
-| `/files/module-mappings` | GET | List module-to-adapter mappings |
-| `/files/module-mappings` | POST | Create module-to-adapter mapping |
-| `/files/module-mappings/{module_name}` | DELETE | Delete module-to-adapter mapping |
-
-## Adapter Resolution
-
-Modules specify only `created_by_module`:
-
-```python
-# Module code
-service = FileService()
-record = await service.save_file(
-    file_content=data,
-    filename="photo.jpg",
-    content_type="image/jpeg",
-    created_by_module="menu",  # Module identifies itself
-)
-```
-
-The service resolves adapter priority:
+## Save Pipeline
 
 ```mermaid
 flowchart TD
-    A[save_file called] --> B{adapter_name param?}
-    B -->|Yes| C[Use specified adapter]
-    B -->|No| D[Check ModuleAdapterMapping]
-    D --> E{Mapping exists?}
-    E -->|Yes| F[Use mapped adapter]
-    E -->|No| G[Use default adapter]
+    A["save_file(file, filename, content_type, created_by_module, db_session)"] --> B{normalize input}
+    B -->|UploadFile| C{size <= stream_threshold?}
+    B -->|bytes| D["_process_bytes()"]
+    B -->|AsyncIterable| E["_process_stream() -> temp Path"]
+    C -->|yes| D
+    C -->|no| E
+
+    D --> F["checksum, size, bytes"]
+    E --> G["checksum, size, temp_path"]
+
+    F --> H["validation hooks"]
+    G --> H
+
+    H --> I["duplicate check (checksum + module)"]
+    I -->|existing| J["new FileRecord referencing same storage_key"]
+    I -->|new| K["adapter.save(storage_key, bytes|Path, content_type)"]
+
+    J --> L["flush"]
+    K --> M["cleanup temp_path"]
+    M --> N["FileRecord + flush"]
+    L --> O["return record"]
+    N --> O
 ```
 
-## Module-to-Adapter Mapping
-
-Map modules to adapters at runtime (admin operation):
-
-```bash
-# POST /files/module-mappings
-{"module_name": "menu", "adapter_name": "local", "use_module_dir": true}
-{"module_name": "orders", "adapter_name": "s3", "use_module_dir": false}
-```
-
-Modules don't call this - administrators configure it. Modules only use their identifier.
-
-## Directory Storage Logic
-
-```mermaid
-flowchart TB
-    A["save_file called"] --> B{"use_module_dir?"}
-    B -->|No| C["STORAGE_DIR/\{uuid\}"]
-    B -->|Yes| D{"channel provided?"}
-    D -->|No| E["STORAGE_DIR/{module_name}/{uuid}"]
-    D -->|Yes| F["STORAGE_DIR/{module_name}/{channel}/{uuid}"]
-```
-
-Examples:
-- `use_module_dir=false` → `STORAGE_DIR/uuid`
-- `use_module_dir=true, channel=""` → `STORAGE_DIR/menu/uuid`
-- `use_module_dir=true, channel="images"` → `STORAGE_DIR/menu/images/uuid`
-
-## Configuration
-
-```bash
-# .env
-CHACC_FILE_MANAGER_STORAGE_DIR=/var/lib/app/uploads
-CHACC_FILE_MANAGER_MAX_FILE_SIZE=52428800
-```
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `STORAGE_DIR` | `/tmp/chacc_file_storage` | Base directory |
-| `MAX_FILE_SIZE` | `10485760` | Max bytes (10MB) |
-
-## Extending the File Manager
-
-This module handles file uploads, storage, and serving out of the box. By default, files are stored on the local filesystem. If you need files to live somewhere else — Google Drive, S3, a database, or anywhere else — you can extend it with a custom adapter. No changes to this module are required.
-
-### What This Module Provides
-
-- **File upload and download** via a simple service interface
-- **UUID-based file addressing** — files are referenced by a stable UUID, not by path
-- **Local filesystem storage** as the default adapter
-- **Module-to-adapter routing** — different modules can use different storage backends
-- **Streaming with range requests** — works for images, videos, and large files
-
-### How Other Modules Use It
-
-Any ChaCC module can save, retrieve, and delete files by obtaining the file service from the backbone context:
+## Quick Start
 
 ```python
 from .context_factory import get_module_context
 
 file_service = get_module_context().get_service("file_service")
 
-# Save a file
 record = await file_service.save_file(
-    file_content=data,
+    file=upload_file,          # UploadFile | bytes | AsyncIterable[bytes]
     filename="photo.jpg",
     content_type="image/jpeg",
-    created_by_module="menu",  # Your module name
+    created_by_module="menu",
+    channel="images",          # optional, only used if module mapping sets use_module_dir=true
+    db_session=db,
 )
 
-# Get a download URL
 url = await file_service.get_download_url(
     file_uuid=record.uuid,
     request=request,
@@ -223,46 +127,102 @@ url = await file_service.get_download_url(
 )
 ```
 
-That's it. The module does not need to know where files are stored, which adapter is used, or how paths are resolved.
+## Unified `file` Parameter
 
-### What You Can Do as an Extension
+`save_file()` accepts **one** `file` parameter with three shapes:
 
-As a module author, you can:
+| Shape | Behavior |
+|-------|----------|
+| `UploadFile` | If `size <= STREAM_THRESHOLD`, reads into memory. Otherwise streams chunks from the upload. |
+| `bytes` | Fast path — no temp file, direct checksum + adapter write. |
+| `AsyncIterable[bytes]` | Streamed path — written to a service-managed temp file for checksumming, then passed to the adapter as a `Path`. |
 
-1. **Register a new adapter** so files can be stored in your backend of choice
-2. **Map a module to your adapter** so all files from that module use your backend
-3. **Let the file manager handle routing** — it will automatically use your adapter when appropriate
+## Validation Hooks
 
-### The Adapter Contract
-
-An adapter is any object that implements the following methods. It does not need to inherit from a specific class — it just needs to match this interface:
-
-| Method | Purpose | Returns |
-|--------|---------|---------|
-| `save(file_uuid, content, content_type)` | Store file bytes | `str` — the storage key (usually just `file_uuid`) |
-| `delete(storage_key)` | Remove a stored file | `bool` — `True` if successful |
-| `exists(storage_key)` | Check if a file exists | `bool` |
-| `get_size(storage_key)` | Get file size in bytes | `int` |
-| `get_url(storage_key, request)` | Generate a URL for accessing the file | `str` |
-| `read_stream(storage_key, start, end)` | Stream file bytes, optionally bounded by byte range | Async iterator of `bytes` chunks |
-| `health_check()` | Verify the adapter is operational | `bool` |
-
-**Rules of the contract:**
-- `file_uuid` and `storage_key` are opaque strings assigned by the file manager. Treat them as identifiers, not filesystem paths.
-- `read_stream` must support `start` and `end` parameters for range requests. If `end` is `None`, stream to the end of the file.
-- If your backend does not support streaming, read the full content in memory and yield it in chunks. The file manager will handle it correctly.
-- `get_url` should return a URL the client can use to access the file. For external backends, this can be a presigned URL or a proxy endpoint.
-
-**Development stub**
-
-For IDE autocomplete and type checking during development, copy this class into your module. It is not imported from the file manager — it is a local development aid only. At runtime, the actual base class is fetched from the backbone context and your adapter is validated against it during registration.
+Optional async hooks run **before** duplicate checking and before `adapter.save()`. They receive:
+- `payload`: `bytes` for small files, `Path` for streamed files
+- `metadata`: always `{}` at this stage (adapter has not run yet)
+- `is_path`: `True` if `payload` is a `Path`
 
 ```python
-# In your module — for development only
+async def require_image_dimensions(payload, metadata, is_path):
+    if is_path:
+        data = await aiofiles.os.path.getsize(payload)
+    else:
+        data = payload
+    image = Image.open(io.BytesIO(data))
+    if image.width < 800 or image.height < 600:
+        raise ValueError("Image too small")
+
+record = await file_service.save_file(
+    ...
+    validation_hooks=[require_image_dimensions],
+)
+```
+
+## Deduplication
+
+If a file with the same `checksum` already exists for the same `created_by_module`, the service:
+1. Skips writing to the adapter
+2. Creates a **new** `FileRecord` with a fresh UUID
+3. Reuses the existing `storage_key`
+4. Flushes both records in the same transaction
+
+This means identical uploads share storage, but every caller gets its own DB row with its own UUID and metadata.
+
+## Transaction Model
+
+- **Service layer**: `db_session.add(record)` + `db_session.flush()` + `db_session.refresh(record)`
+- **Route layer**: owns `db_session.commit()`
+
+This keeps the service testable without implicit commits and avoids nested savepoints.
+
+## Adapter Contract
+
+An adapter is any object implementing these methods. It does **not** need to inherit from a specific class.
+
+| Method | Signature | Returns | Notes |
+|--------|-----------|---------|-------|
+| `save` | `(file_uuid: str, content: Union[bytes, Path], content_type: str) -> dict` | `dict` | Returns adapter metadata. Local adapter returns `{"storage_key": ..., "adapter": ...}`. |
+| `delete` | `(storage_key: str) -> bool` | `bool` | `True` if successful. |
+| `exists` | `(storage_key: str) -> bool` | `bool` | |
+| `get_size` | `(storage_key: str) -> int` | `int` | Size in bytes. |
+| `get_url` | `(storage_key: str, request: Request) -> str` | `str` | Client-facing URL. |
+| `read_stream` | `(storage_key: str, start: int = 0, end: Optional[int] = None) -> AsyncIterator[bytes]` | async iterator | Must support byte ranges for 206 Partial Content. |
+| `health_check` | `() -> bool` | `bool` | Default implementation returns `True`. |
+
+**Rules**
+- `file_uuid` and `storage_key` are opaque identifiers. Do not treat them as filesystem paths unless your adapter needs to.
+- `content` is either `bytes` (small files) or a `Path` to a temp file (streamed files). Your adapter is responsible for handling both.
+- `read_stream` must honor `start` and `end`. If your backend cannot seek, read the full content and slice it in memory.
+
+## Storage Layout
+
+The `storage_key` passed to your adapter is built as follows:
+
+```mermaid
+flowchart TB
+    A["save_file()"] --> B{"use_module_dir?"}
+    B -->|No| C["storage_key = uuid"]
+    B -->|Yes| D{"channel provided?"}
+    D -->|No| E["storage_key = module_name/uuid"]
+    D -->|Yes| F["storage_key = module_name/channel/uuid"]
+```
+
+Examples:
+- Flat: `019f45a2-35fa-7682-ba04-3c2c5e1d1163`
+- Module dir: `menu/019f45a2-35fa-7682-ba04-3c2c5e1d1163`
+- Module + channel: `menu/images/019f45a2-35fa-7682-ba04-3c2c5e1d1163`
+
+## Development Stub
+
+Copy this into your module for IDE support. It is not imported at runtime.
+
+```python
 class BaseAdapter:
     name: str = "base"
 
-    async def save(self, file_uuid: str, content: bytes, content_type: str) -> str:
+    async def save(self, file_uuid: str, content, content_type: str) -> dict:
         raise NotImplementedError
 
     async def delete(self, storage_key: str) -> bool:
@@ -277,168 +237,168 @@ class BaseAdapter:
     async def get_url(self, storage_key: str, request) -> str:
         raise NotImplementedError
 
-    async def read_stream(self, storage_key: str, start: int = 0, end: int | None = None):
+    async def read_stream(self, storage_key: str, start: int = 0, end=None):
         raise NotImplementedError
 
     async def health_check(self) -> bool:
         return True
 ```
 
-Use it like this:
+At runtime, fetch the actual class from the backbone context to validate adapters structurally:
 
 ```python
-class GDriveAdapter(BaseAdapter):
-    name = "gdrive"
-
-    async def save(self, file_uuid, content, content_type):
-        # Your implementation
-        ...
-```
-
-At registration time, your adapter is validated against the adapter contract. If a method is missing or has the wrong signature, registration fails with a clear error.
-
-**Using the context-provided `BaseAdapter`**
-
-The file manager exposes the actual `BaseAdapter` class through the backbone context under the service name `"base_adapter"`. This is not an instance — it is the **class type itself**. You can fetch it and cast it to your local stub so the IDE treats your adapter as a proper subclass:
-
-```python
-from .base_adapter_stub import BaseAdapter
 from typing import cast
-
 _base_adapter_class = get_module_context().get_service("base_adapter")
 BaseAdapter = cast(type[BaseAdapter], _base_adapter_class)
-
-class GDriveAdapter(BaseAdapter):
-    name = "gdrive"
-    ...
 ```
 
-If you do not need IDE support, you can skip the local stub and cast entirely. Registration will still validate your adapter structurally.
-
-### Step-by-Step: Adding a GDrive Adapter
-
-Here is a complete example of how another module would add Google Drive support.
-
-**Step 1 — Create your adapter class**
-
-This lives inside your own module. For IDE support during development, copy the `BaseAdapter` stub from the contract section above into your module. Your adapter inherits from it. You do not import anything from the file manager.
+## Example: S3 Adapter
 
 ```python
-# gdrive_module/src/gdrive_adapter.py
-from .base_adapter_stub import BaseAdapter
+class S3Adapter(BaseAdapter):
+    name = "s3"
 
-class GDriveAdapter(BaseAdapter):
-    name = "gdrive"
-
-    def __init__(self, credentials_path, folder_id):
-        self.credentials_path = credentials_path
-        self.folder_id = folder_id
-        # Initialize your Drive client here
+    def __init__(self, bucket, client):
+        self.bucket = bucket
+        self.client = client
 
     async def save(self, file_uuid, content, content_type):
-        # Upload bytes to Google Drive
-        # Return file_uuid as storage_key (or map to a Drive ID internally)
-        drive_file = await self._upload(content, file_uuid)
-        return file_uuid
+        key = f"uploads/{file_uuid}"
+        if isinstance(content, Path):
+            await self.client.upload_from_path(self.bucket, key, content)
+        else:
+            await self.client.upload_bytes(self.bucket, key, content, content_type)
+        return {"storage_key": file_uuid, "adapter": self.name, "s3_key": key}
 
     async def delete(self, storage_key):
-        # Delete from Google Drive
+        await self.client.delete(self.bucket, f"uploads/{storage_key}")
         return True
 
     async def exists(self, storage_key):
-        # Check if file exists in Drive
-        return True
+        return await self.client.exists(self.bucket, f"uploads/{storage_key}")
 
     async def get_size(self, storage_key):
-        # Return file size from Drive metadata
-        return 0
+        return await self.client.size(self.bucket, f"uploads/{storage_key}")
 
     async def get_url(self, storage_key, request):
-        # Return a shareable or proxy URL
-        return f"https://drive.google.com/file/{storage_key}"
+        return await self.client.presigned_url(self.bucket, f"uploads/{storage_key}")
 
     async def read_stream(self, storage_key, start=0, end=None):
-        # Stream bytes from Drive API in chunks
-        chunk_size = 8192
-        # ... yield chunks ...
-        yield b""
+        key = f"uploads/{storage_key}"
+        return self.client.stream(self.bucket, key, start=start, end=end)
 
     async def health_check(self):
-        return True
+        return await self.client.ping(self.bucket)
 ```
 
-**Step 2 — Register your adapter at module startup**
+## Configuration
 
-In your module's `setup_plugin()`, obtain the registration hook from the backbone context and register your adapter:
+Configuration is read via `BackboneContext.get_module_config()` from `.env`. All variables are prefixed with `CHACC_FILE_MANAGER_`.
 
-```python
-# gdrive_module/src/main.py
-from .context_factory import get_context, set_module_context
-from .gdrive_adapter import GDriveAdapter
-
-def setup_plugin(context=None):
-    ctx = get_context(context)
-    set_module_context(ctx)
-
-    adapter = GDriveAdapter(
-        credentials_path="/etc/secrets/gdrive.json",
-        folder_id="abc123",
-    )
-
-    register_file_adapter = ctx.get_service("register_file_adapter")
-    register_file_adapter(adapter, name="gdrive", description="Google Drive storage")
-
-    return gdrive_router
+```bash
+# .env
+CHACC_FILE_MANAGER_STORAGE_DIR=/var/lib/app/uploads
+CHACC_FILE_MANAGER_MAX_FILE_SIZE=52428800
+CHACC_FILE_MANAGER_STREAM_THRESHOLD=10485760
+CHACC_FILE_MANAGER_UPLOAD_CHUNK_SIZE=65536
+CHACC_FILE_MANAGER_ALLOWED_CONTENT_TYPES=image/jpeg,image/png,application/pdf
 ```
 
-That's all that is needed to make your adapter available to the file manager.
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STORAGE_DIR` | `/tmp/chacc_file_storage` | Base directory for the local adapter. |
+| `MAX_FILE_SIZE` | `10485760` | Maximum upload size in bytes (10 MB). |
+| `STREAM_THRESHOLD` | `10485760` | Files larger than this are streamed to a temp file instead of loaded into memory (10 MB). |
+| `UPLOAD_CHUNK_SIZE` | `8192` | Bytes to read per chunk when streaming from `UploadFile`. |
+| `ALLOWED_CONTENT_TYPES` | `""` (allow all) | Comma-separated MIME types allowed. Empty means no restriction. |
 
-**Step 3 — Map a module to your adapter**
+### Determining the right thresholds
 
-Once your adapter is registered, an administrator can map any module to it:
+- Set `STREAM_THRESHOLD` to the maximum comfortable in-memory size for your deployment.
+- Set `MAX_FILE_SIZE` to the absolute ceiling you want enforced at the service layer.
+- `UPLOAD_CHUNK_SIZE` controls how aggressively the service drains the `UploadFile` stream. Larger values reduce coroutine overhead; smaller values reduce memory spikes during streaming.
+
+## Module-to-Adapter Mapping
+
+Administrators map modules to adapters via the management API:
 
 ```bash
 POST /files/module-mappings
 {
   "module_name": "menu",
-  "adapter_name": "gdrive",
-  "use_module_dir": true
+  "adapter_name": "s3",
+  "use_module_dir": true,
+  "description": "Menu images stored in S3"
 }
 ```
 
-After this, every file uploaded by the `menu` module with `created_by_module="menu"` will be stored in Google Drive instead of the local filesystem.
+Resolution order:
+1. Explicit `adapter_name` passed to `save_file()`
+2. `ModuleAdapterMapping` for `created_by_module`
+3. Default adapter (first registered, or explicitly set via `set_default=True`)
 
-### How Files Are Organized
+## API Endpoints
 
-The file manager builds a `storage_key` for each file. This key is passed to your adapter's methods. The pattern is:
+### File Operations
 
-- **Flat**: `storage_key = "<uuid>"`
-- **With module directory**: `storage_key = "<module_name>/<uuid>"`
-- **With module and channel**: `storage_key = "<module_name>/<channel>/<uuid>"`
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/files/` | POST | Admin/Module | Upload a file (`multipart/form-data` with `file` field, optional `channel`) |
+| `/files/{uuid}/content` | GET | Public | Serve file content by UUID |
+| `/files/{uuid}/content?download=1` | GET | Public | Download with `Content-Disposition: attachment` |
+| `/files/{uuid}` | DELETE | Admin/Module | Soft-delete a file by UUID |
 
-This structure is controlled by the `use_module_dir` flag in the module mapping. Your adapter receives the full key and can use it however it wants — as a folder path, a metadata prefix, or ignore it entirely.
+### Metadata Endpoints
 
-### What You Should Not Do
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/files/adapters` | GET | Admin | List all registered adapters |
+| `/files/adapters/{name}` | GET | Admin | Get adapter info |
+| `/files/module-mappings` | GET | Admin | List module-to-adapter mappings |
+| `/files/module-mappings` | POST | Admin | Create module-to-adapter mapping |
+| `/files/module-mappings/{module_name}` | DELETE | Admin | Delete module-to-adapter mapping |
 
-- Do not import `BaseAdapter`, `AdapterRegistry`, or any internal class directly from this module's source
-- Do not modify this module's code to support your backend
-- Do not store absolute filesystem paths in your adapter — the file manager handles path resolution
-- Do not override the default adapter (`local`). The local adapter is always the fallback.
+## Response Headers
 
-### Troubleshooting
+Successful file serves include:
 
-**My adapter is not being used:**
-- Verify the module mapping exists: `GET /files/module-mappings`
-- Verify your adapter is registered: `GET /files/adapters`
-- Check that `adapter_name` in the mapping exactly matches the name you used during registration
+```http
+Content-Type: <file content_type>
+Content-Disposition: inline; filename="photo.jpg"
+Cache-Control: public, max-age=31536000, immutable
+ETag: "<sha256_checksum>"
+Accept-Ranges: bytes  (only on range requests)
+```
 
-**Files are uploaded but not found:**
-- Ensure your `read_stream` and `exists` methods use the same `storage_key` logic as `save`
-- Ensure `get_size` returns the correct size in bytes
+## Security
 
-**Range requests fail:**
-- Your `read_stream` must honor the `start` and `end` parameters
-- If your backend does not support byte ranges, read the full file and slice it in memory
+- Path traversal protection via `_get_storage_path()` path containment check
+- Original filenames are sanitized before persistence
+- Content-type allowlist enforced before reading body
+- No filesystem paths exposed in API responses
+- Adapter registration is structural, not import-based
+
+## What You Should Not Do
+
+- Do not import `BaseAdapter`, `AdapterRegistry`, or internal classes directly from this module's source
+- Do not modify this module's code to support a new backend
+- Do not store absolute filesystem paths in adapter metadata
+- Do not assume `storage_key` is a path unless your adapter needs it to be
+
+## Troubleshooting
+
+**Adapter not being used:**
+- `GET /files/module-mappings` — verify mapping exists
+- `GET /files/adapters` — verify adapter is registered
+- Check exact spelling of `adapter_name`
+
+**Upload fails with "File too large":**
+- Check `MAX_FILE_SIZE` in `.env`
+- For chunked uploads, also check `STREAM_THRESHOLD` vs uploaded size
+
+**Range requests return 416:**
+- Adapter `read_stream` must honor `start` and `end`
+- If backend does not support seeks, buffer and slice in memory
 
 ## Testing
 

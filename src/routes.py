@@ -135,18 +135,16 @@ async def upload_file(
     if not file:
         raise HTTPException(status_code=400, detail="No file provided")
 
-    content = await file.read()
     content_type = file.content_type or "application/octet-stream"
 
     try:
         record = await service.save_file(
-            file_content=content,
+            file=file,
             filename=file.filename,
             content_type=content_type,
             created_by_module="chacc_file_manager",
             channel=form.get("channel"),
         )
-        db.add(record)
         db.commit()
         return {"uuid": record.uuid, "filename": record.filename, "size": record.size, "storage_key": record.storage_key}
     except (FileTooLargeError, InvalidContentTypeError) as e:
@@ -162,3 +160,4 @@ async def delete_file(
     deleted = await service.delete_file(uuid, db)
     if not deleted:
         raise HTTPException(status_code=404, detail="File not found")
+    db.commit()
