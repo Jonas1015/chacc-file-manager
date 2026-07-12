@@ -6,7 +6,7 @@
   "description": "A new ChaCC module providing files management functionality.",
   "entry_point": "src.main:setup_plugin",
   "test_entry_point": "src.tests.test_module:run_module_tests",
-  "base_path_prefix": "/chacc-file-manager",
+  "base_path_prefix": "/files",
   "dependencies_file": "requirements.txt",
   "required_chacc_version": ">=1.0.0",
   "license": "MIT",
