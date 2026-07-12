@@ -148,7 +148,7 @@ class FileService(BaseFileService):
                     FileRecord.created_by_module == created_by_module,
                 )
             )
-            return result.scalar_one_or_none()
+            return result.scalars().first()
 
         return await asyncio.to_thread(_query)
 
