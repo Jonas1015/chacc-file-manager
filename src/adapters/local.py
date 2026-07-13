@@ -64,7 +64,7 @@ class LocalAdapter(BaseAdapter):
         return os.path.getsize(full_path)
 
     async def get_url(self, storage_key: str, request: Request) -> str:
-        url = request.url_for("files:serve", uuid=storage_key)
+        url = request.url_for("serve_file", uuid=storage_key)
         return str(url)
 
     def _detect_mime_type(self, filename: str) -> str:

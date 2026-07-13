@@ -30,7 +30,7 @@ class FileRecord(ChaCCBaseModel):
 class ModuleAdapterMapping(ChaCCBaseModel):
     __tablename__ = "file_module_adapter_mappings"
 
-    module_name = Column(String(100), primary_key=True)
+    module_name = Column(String(100), unique=True, nullable=False)
     adapter_name = Column(String(100), nullable=False)
     use_module_dir = Column(Boolean, default=False, nullable=False)
     description = Column(String(500), nullable=True)

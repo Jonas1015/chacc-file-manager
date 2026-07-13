@@ -18,7 +18,7 @@ class ModuleMappingCreate(BaseModel):
     description: Optional[str] = None
 
 
-router = APIRouter(prefix="/files")
+router = APIRouter()
 
 
 @router.get("/adapters")

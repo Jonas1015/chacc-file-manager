@@ -106,6 +106,34 @@ def test_router_exists():
     assert hasattr(router, "routes")
 
 
+def test_router_has_no_baked_in_prefix():
+    from ..routes import router
+    assert router.prefix == ""
+
+
+@pytest.mark.asyncio
+async def test_local_adapter_get_url_resolves():
+    from fastapi import FastAPI, Request
+    from starlette.testclient import TestClient
+    from ..routes import router
+    from ..adapters.local import LocalAdapter
+
+    app = FastAPI()
+    app.include_router(router, prefix="/files")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adapter = LocalAdapter(storage_dir=tmpdir)
+
+        @app.get("/test-get-url")
+        async def _probe(request: Request):
+            return {"url": await adapter.get_url("some-uuid", request)}
+
+        with TestClient(app) as client:
+            resp = client.get("/test-get-url")
+            assert resp.status_code == 200
+            assert resp.json()["url"].endswith("/files/some-uuid/content")
+
+
 def run_module_tests():
     import subprocess
     tests_dir = Path(__file__).resolve().parent
