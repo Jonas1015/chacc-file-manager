@@ -1,8 +1,8 @@
 {
-  "name": "file-manager",
+  "name": "chacc-file-manager",
   "display_name": "Chacc File Manager Module",
   "version": "0.1.0",
-  "author": "Your Name/Organization",
+  "author": "Jonas G Mwambimbi",
   "description": "A new ChaCC module providing files management functionality.",
   "entry_point": "src.main:setup_plugin",
   "test_entry_point": "src.tests.test_module:run_module_tests",
